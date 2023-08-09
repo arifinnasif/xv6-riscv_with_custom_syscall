@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "rand.h"
+#include "pstat.h"
 
 struct cpu cpus[NCPU];
 
@@ -145,6 +147,10 @@ found:
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  p->original_ticket=1;
+  p->current_ticket=1;
+  p->time_slice_count=0;
 
   return p;
 }
@@ -294,6 +300,9 @@ fork(void)
     release(&np->lock);
     return -1;
   }
+  np->current_ticket = np->original_ticket = p->original_ticket;
+  // np->current_ticket = p->current_ticket;
+  // np->time_slice_count = p->time_slice_count;
   np->sz = p->sz;
 
   // copy saved user registers.
@@ -441,6 +450,36 @@ wait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+// void
+// scheduler(void)
+// {
+//   struct proc *p;
+//   struct cpu *c = mycpu();
+  
+//   c->proc = 0;
+//   for(;;){
+//     // Avoid deadlock by ensuring that devices can interrupt.
+//     intr_on();
+
+//     for(p = proc; p < &proc[NPROC]; p++) {
+//       acquire(&p->lock);
+//       if(p->state == RUNNABLE) {
+//         // Switch to chosen process.  It is the process's job
+//         // to release its lock and then reacquire it
+//         // before jumping back to us.
+//         p->state = RUNNING;
+//         c->proc = p;
+//         swtch(&c->context, &p->context);
+
+//         // Process is done running for now.
+//         // It should have changed its p->state before coming back.
+//         c->proc = 0;
+//       }
+//       release(&p->lock);
+//     }
+//   }
+// }
+
 void
 scheduler(void)
 {
@@ -452,19 +491,48 @@ scheduler(void)
     // Avoid deadlock by ensuring that devices can interrupt.
     intr_on();
 
+    uint64 total_ticket_count = 0;
+
+    for(p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if(p->state == RUNNABLE) total_ticket_count += p->current_ticket;
+      release(&p->lock);
+    }
+
+    if(total_ticket_count == 0) {
+      for(p=proc; p<&proc[NPROC]; p++) {
+        // printf("here\n");
+        acquire(&p->lock);
+        if(p->state == RUNNABLE) {
+          p->current_ticket = p->original_ticket;
+          // total_ticket_count += p->current_ticket;
+        }
+        release(&p->lock);
+      }
+      continue;
+    }
+
+    uint64 winner = random_at_most(total_ticket_count - 1);
+    uint64 cummulitive_ticket_sum = 0;
+
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
+        cummulitive_ticket_sum += p->current_ticket;
+        // printf("winner: %d, cummulitive_ticket_sum: %d, current_ticket: %d, time_slice_count: %d total_ticket: %d\n", winner, cummulitive_ticket_sum, p->current_ticket, p->time_slice_count, total_ticket_count);
+        if(winner < cummulitive_ticket_sum) { // less than or less than equal to?
+          
+          p->current_ticket--;
+          p->time_slice_count++;
+          p->state = RUNNING;
+          c->proc = p;
+          // printf("++%s\n",p->name);
+          swtch(&c->context, &p->context);
+          // printf("--%s\n",p->name);
+          c->proc = 0;
+          release(&p->lock);
+          break;
+        }
       }
       release(&p->lock);
     }
@@ -680,4 +748,37 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+
+int settickets(int number) {
+  struct proc *p = myproc();
+  if (number < 1) {
+    return -1;
+  }
+  acquire(&p->lock);
+  p->current_ticket = p->original_ticket = number;
+  release(&p->lock);
+  return 0;
+}
+
+
+int getpinfo(uint64 addr) {
+  struct pstat ps;
+  struct proc *p;
+  int i = 0;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    ps.pid[i] = p->pid;
+    ps.inuse[i] = p->state != UNUSED;
+    ps.tickets_original[i] = p->original_ticket;
+    ps.tickets_current[i] = p->current_ticket;
+    ps.time_slices[i] = p->time_slice_count;
+    release(&p->lock);
+    i++;
+  }
+  if (either_copyout(1, addr, (char *)&ps, sizeof(ps)) < 0) {
+    return -1;
+  }
+  return 0;
 }
