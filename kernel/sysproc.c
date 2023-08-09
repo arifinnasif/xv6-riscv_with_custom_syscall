@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "proc.h"
 
+
 uint64
 sys_exit(void)
 {
@@ -88,4 +89,27 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+
+
+uint64
+sys_trace(void)
+{
+  int n; // the sys_call num to track
+  argint(0, &n);
+  if (n<1 || n>23) return -1;
+  struct proc *p = myproc();
+  // add condition that might cause failure
+  p->is_trace=n;
+  return p->pid;
+}
+
+
+uint64
+sys_sysinfo(void)
+{
+  printf("sysinfo system call prints:\nfree-memory: %d bytes\nn_proc: %d\n", free_page_count()*PGSIZE, existing_proc_count());
+  // add condition that might cause failure
+  return 0;
 }

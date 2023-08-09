@@ -54,6 +54,7 @@ procinit(void)
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
+      p->is_trace = 0;
       p->kstack = KSTACK((int) (p - proc));
   }
 }
@@ -169,6 +170,8 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  p->is_trace = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -298,6 +301,9 @@ fork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+
+  // copy is_trace.
+  np->is_trace = p->is_trace;
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
@@ -680,4 +686,20 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+
+int existing_proc_count(void) {
+  struct proc *p;
+  int count = NPROC;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      count--;
+    }
+    release(&p->lock);
+  }
+
+  return count;
 }
