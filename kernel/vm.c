@@ -131,7 +131,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
 void
 kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
 {
-  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
+  if(mappages2(kpgtbl, va, sz, pa, perm) != 0)
     panic("kvmmap");
 }
 
@@ -150,6 +150,42 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
   
   a = PGROUNDDOWN(va);
   last = PGROUNDDOWN(va + size - 1);
+  if(last >= MAXVA)
+    return -1;
+  
+  for(;;){
+    ref_count_up((void*)pa);
+    if((pte = walk(pagetable, a, 1)) == 0)
+      return -1;
+    if(*pte & PTE_V)
+      panic("mappages: remap");
+    *pte = PA2PTE(pa) | perm | PTE_V;
+    if(a == last)
+      break;
+    a += PGSIZE;
+    pa += PGSIZE;
+  }
+  return 0;
+}
+
+// Create PTEs for virtual addresses starting at va that refer to
+// physical addresses starting at pa. va and size might not
+// be page-aligned. Returns 0 on success, -1 if walk() couldn't
+// allocate a needed page-table page.
+int
+mappages2(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+{
+  uint64 a, last;
+  pte_t *pte;
+
+  if(size == 0)
+    panic("mappages: size");
+  
+  a = PGROUNDDOWN(va);
+  last = PGROUNDDOWN(va + size - 1);
+  if(last >= MAXVA)
+    return -1;
+
   for(;;){
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
@@ -185,7 +221,12 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not a leaf");
     if(do_free){
       uint64 pa = PTE2PA(*pte);
+      if(*pte & PTE_COW && get_ref_count((void *)pa) == 1) {
+        if(VERBOSE) printf("freeing a cow page with first char in hex %p\n", *(char *)pa);
+      }
       kfree((void*)pa);
+    } else {
+      ref_count_down((void *)PTE2PA(*pte));
     }
     *pte = 0;
   }
@@ -308,7 +349,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -317,12 +358,22 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    // code for copying to new physical page
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if((flags & PTE_W) && (flags & PTE_V)) {
+      flags &= ~PTE_W;
+      flags |= PTE_COW;
+      *pte = PA2PTE(pa) | flags;
+      sfence_vma();
+    }
+    if(flags & PTE_V) {
+      // ref_count_up((void*)pa);
+      if(mappages(new, i, PGSIZE, pa, flags) != 0){
+        // kfree(mem);
+        goto err;
+      }
     }
   }
   return 0;
@@ -355,12 +406,36 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if(va0 >= MAXVA) return -1;
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
+    pte_t *pte = walk(pagetable, va0, 0);
+    if(*pte & PTE_COW) {
+      if(get_ref_count((void *) PTE2PA(*pte)) == 1) {
+        *pte = *pte & ~PTE_COW;
+        *pte = *pte | PTE_W;
+        sfence_vma();
+      } else if (get_ref_count((void *) PTE2PA(*pte)) > 1) {
+        char *mem;
+        if((mem = kalloc()) == 0)
+          return -1;
+        memmove(mem, (char*)pa0, PGSIZE);
+        uint64 flags = PTE_FLAGS(*pte);
+        flags &= ~PTE_COW;
+        flags |= PTE_W;
+        uvmunmap(pagetable, va0, 1, 0);
+        sfence_vma();
+        if(mappages(pagetable, va0, PGSIZE, (uint64)mem, flags) < 0) {
+          uvmunmap(pagetable, va0, 1, 1);
+          return -1;
+        }
+        pa0 = (uint64)mem;
+      }
+    }
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;

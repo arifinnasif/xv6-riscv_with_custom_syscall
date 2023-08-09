@@ -89,3 +89,14 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sysinfo(void)
+{
+  printf("--------------------\n");
+  printf("sysinfo system call prints:\nfree-memory: %d pages\nthis proc occupies: %d pages\n", free_page_count(), myproc()->sz / PGSIZE);
+  printf("--------------------\n");
+  // add condition that might cause failure
+  return 0;
+}
+

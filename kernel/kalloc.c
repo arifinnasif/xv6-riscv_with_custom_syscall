@@ -21,12 +21,23 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  uint ref_count[(PHYSTOP - KERNBASE) >> PGSHIFT];
+  // uint ref_count[1000];
 } kmem;
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+
+  // initialize ref_count
+  uint i;
+  acquire(&kmem.lock);
+  for(i=0; i < (PHYSTOP - KERNBASE) >> PGSHIFT; i++) {
+    kmem.ref_count[i] = 0;
+  }
+  release(&kmem.lock);
+
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -35,8 +46,9 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE) {
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -51,12 +63,37 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
 
-  r = (struct run*)pa;
+  if((uint64)pa < KERNBASE) {
+    memset(pa, 1, PGSIZE);
+
+    r = (struct run*)pa;
+
+    acquire(&kmem.lock);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    release(&kmem.lock);
+    return;
+  }
 
   acquire(&kmem.lock);
+  if(kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT] < 0) {
+    release(&kmem.lock);
+    panic("kfree: ref_count < 0");
+  }
+
+  if(kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT] > 1) {
+    kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT]--;
+    release(&kmem.lock);
+    return;
+  }
+  // at this point we know that ref_count == 1 or 0
+  kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT] = 0;
+
+  // Fill with junk to catch dangling refs.
+  memset(pa, 1, PGSIZE);
+  r = (struct run*)pa;
+  // acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
@@ -72,11 +109,98 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r) {
     kmem.freelist = r->next;
+  }
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+uint get_ref_count(void *pa) {
+  uint ref_count;
+  acquire(&kmem.lock);
+  if((uint64)pa < KERNBASE) {
+    release(&kmem.lock);
+    return 0;
+  }
+  ref_count = kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT];
+  release(&kmem.lock);
+  return ref_count;
+}
+
+void ref_count_up(void *pa) {
+  acquire(&kmem.lock);
+  if((uint64)pa < KERNBASE) {
+    release(&kmem.lock);
+    return;
+  }
+  
+  kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT]++;
+  
+  release(&kmem.lock);
+}
+
+int ref_count_down(void *pa) {
+  acquire(&kmem.lock);
+  if((uint64)pa < KERNBASE) {
+    release(&kmem.lock);
+    return 0;
+  }
+  if(kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT] <= 0) {
+    release(&kmem.lock);
+    return -1;
+  }
+  
+  kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT]--;
+  
+  release(&kmem.lock);
+  return 0;
+}
+
+int ref_count_down_2(void *pa) {
+  acquire(&kmem.lock);
+  if((uint64)pa < KERNBASE) {
+    release(&kmem.lock);
+    return 0;
+  }
+  
+  kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT]--;
+  release(&kmem.lock);
+  return 0;
+}
+
+void set_ref_count(void *pa, uint ref_count) {
+  acquire(&kmem.lock);
+  if((uint64)pa < KERNBASE) {
+    release(&kmem.lock);
+    return;
+  }
+  kmem.ref_count[((uint64)pa - KERNBASE) >> PGSHIFT] = ref_count;
+  release(&kmem.lock);
+}
+
+
+int free_page_count(void) {
+  int count = 0;
+  struct run * temp;
+  acquire(&kmem.lock);
+  for(temp = kmem.freelist; temp; temp = temp->next) {
+    count++;
+  }
+  release(&kmem.lock);
+  return count;
+}
+
+int total_ref_count(void) {
+  int count = 0;
+  acquire(&kmem.lock);
+  for(int i = 0; i < (PHYSTOP - KERNBASE)>>PGSHIFT; i++) {
+    count+=kmem.ref_count[i];
+    // if(kmem.ref_count[i]) count++;
+  }
+  release(&kmem.lock);
+  return count;
 }

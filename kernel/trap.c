@@ -65,6 +65,62 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if (r_scause() == 15) {
+    // page fault
+    if(VERBOSE) printf("page fault\n");
+    uint64 va = r_stval();
+    uint64 va_base = PGROUNDDOWN(va);
+    if(va_base >= MAXVA) {
+      setkilled(p);
+      goto after_handler;
+    }
+    uint64 pa;
+    uint flags;
+    char *mem;
+    
+    pte_t *pte = walk(p->pagetable, va_base, 0);
+    if(pte == 0)
+      panic("uvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("uvmcopy: page not present");
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    
+    if(!(!(flags & PTE_W) && (flags & PTE_COW))) {
+      setkilled(p);
+      goto after_handler;
+    }
+
+    if(get_ref_count((void *) pa) == 1) {
+      if(VERBOSE) printf("ref_count == 1. converting a cow page to normal. first char in hex %p\n", *(char *)(PGROUNDDOWN(pa)));
+      *pte = *pte & ~PTE_COW;
+      *pte = *pte | PTE_W;
+      sfence_vma();
+      
+      goto after_handler;
+    }
+
+
+
+    // code for copying to new physical page
+    if((mem = kalloc()) == 0) {
+      setkilled(p);
+      goto after_handler;
+    } else {
+      memmove(mem, (char*)pa, PGSIZE);
+      
+      flags &= ~PTE_COW;
+      flags |= PTE_W;
+      uvmunmap(p->pagetable, va_base, 1, 0);
+      
+      sfence_vma();
+      if(mappages(p->pagetable, va_base, PGSIZE, (uint64)mem, flags) != 0){
+        uvmunmap(p->pagetable, va_base, 1, 1);
+        setkilled(p);
+        goto after_handler;
+      }
+
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -73,6 +129,7 @@ usertrap(void)
     setkilled(p);
   }
 
+  after_handler:
   if(killed(p))
     exit(-1);
 

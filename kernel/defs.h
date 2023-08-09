@@ -63,6 +63,13 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+uint get_ref_count(void *pa);
+void ref_count_up(void *pa);
+int ref_count_down(void *pa);
+int ref_count_down_2(void *pa);
+int ref_count_down_if_gt_1(void *pa);
+int             free_page_count(void);
+int             total_ref_count(void);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -160,6 +167,7 @@ void            kvminit(void);
 void            kvminithart(void);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
+int             mappages2(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 void            uvmfirst(pagetable_t, uchar *, uint);
 uint64          uvmalloc(pagetable_t, uint64, uint64, int);
