@@ -65,6 +65,40 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if ((r_scause() == 15) ||
+             (r_scause() == 13) ||
+             (r_scause() == 12)) {
+    uint64 va = PGROUNDDOWN(r_stval());
+    pte_t *pte = walk(p->pagetable, va, 0);
+    uint64 flags = PTE_FLAGS(*pte);
+    if(!(((r_scause() == 15) && ((*pte) & PTE_W) && !((*pte) & PTE_V) && ((*pte) & PTE_SWAP)) ||
+        ((r_scause() == 13) && ((*pte) & PTE_R) && !((*pte) & PTE_V) && ((*pte) & PTE_SWAP)) ||
+        ((r_scause() == 12) && ((*pte) & PTE_X) && !((*pte) & PTE_V) && ((*pte) & PTE_SWAP)))) {
+      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+      setkilled(p);
+      goto after_handler;
+    }
+    struct swap_info s = remove_swap_info(va, p->pid);
+    if((char) s.exist < (char) 0) {
+      printf("killing %d\n", p->pid);
+      setkilled(p);
+      goto after_handler;
+    }
+    char* pa = kalloc();
+    flags |= PTE_V;
+    flags &= ~PTE_SWAP;
+    swapin(pa, s.swap_page);
+    printf("<<<swapped in va:%p pid:%d\n", va, p->pid);
+    // printf("swap freed\n");
+    swapfree(s.swap_page);
+    uvmunmap(p->pagetable, va, 1, 0, p->pid);
+    sfence_vma();
+    mappages(p->pagetable, va, PGSIZE, (uint64)pa, flags);
+    if(p->pid !=0 && !(flags & PTE_X)) {
+      add_a_live_page(va, (uint64)pa, p->pid);
+    }
+
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {
@@ -72,6 +106,8 @@ usertrap(void)
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     setkilled(p);
   }
+
+  after_handler:
 
   if(killed(p))
     exit(-1);

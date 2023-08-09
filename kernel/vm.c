@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -99,6 +101,7 @@ walk(pagetable_t pagetable, uint64 va, int alloc)
       *pte = PA2PTE(pagetable) | PTE_V;
     }
   }
+  set_use_bit2(va, pagetable);
   return &pagetable[PX(0, va)];
 }
 
@@ -168,7 +171,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
 // page-aligned. The mappings must exist.
 // Optionally free the physical memory.
 void
-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free, int pid)
 {
   uint64 a;
   pte_t *pte;
@@ -179,13 +182,25 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
       panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
+    if((*pte & PTE_V) == 0 && (*pte & PTE_SWAP) == 0)
       panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+    
+    
+    
+
     if(do_free){
+      if(pid>0 && (*pte & PTE_SWAP) != 0) {
+        struct swap_info s = remove_swap_info(a, pid);
+        if((char) s.exist > (char) 0) {
+          // printf("swap freed\n");
+          swapfree(s.swap_page);
+        }
+      }
+      remove_a_live_page(a, pid);
       uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+      if((*pte & PTE_SWAP) == 0) kfree((void*)pa);
     }
     *pte = 0;
   }
@@ -223,7 +238,7 @@ uvmfirst(pagetable_t pagetable, uchar *src, uint sz)
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm, int pid)
 {
   char *mem;
   uint64 a;
@@ -235,14 +250,17 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
   for(a = oldsz; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
-      uvmdealloc(pagetable, a, oldsz);
+      uvmdealloc(pagetable, a, oldsz, pid);
       return 0;
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
-      uvmdealloc(pagetable, a, oldsz);
+      uvmdealloc(pagetable, a, oldsz, pid);
       return 0;
+    }
+    if(pid != 0 && !(xperm & PTE_X)){
+      add_a_live_page(a, (uint64)mem, pid);
     }
   }
   return newsz;
@@ -253,14 +271,14 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
 uint64
-uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int pid)
 {
   if(newsz >= oldsz)
     return oldsz;
 
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1, pid);
   }
 
   return newsz;
@@ -289,10 +307,10 @@ freewalk(pagetable_t pagetable)
 // Free user memory pages,
 // then free page-table pages.
 void
-uvmfree(pagetable_t pagetable, uint64 sz)
+uvmfree(pagetable_t pagetable, uint64 sz, int pid)
 {
   if(sz > 0)
-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1, pid);
   freewalk(pagetable);
 }
 
@@ -303,7 +321,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy(pagetable_t old, pagetable_t new, uint64 sz, int oldpid, int newpid)
 {
   pte_t *pte;
   uint64 pa, i;
@@ -313,13 +331,31 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
+    if(!(*pte & PTE_V) && !(*pte & PTE_SWAP))
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
       goto err;
-    memmove(mem, (char*)pa, PGSIZE);
+    if(!(flags & PTE_V) && (flags & PTE_SWAP)) {
+      struct swap_info s = remove_swap_info(i, oldpid);
+      if(s.exist < 0) {
+        panic("uvmcopy: swap page not present");
+      }
+      flags |= PTE_V;
+      flags &= ~PTE_SWAP;
+      swapin(mem, s.swap_page);
+      swapfree(s.swap_page);
+      pa = (uint64)kalloc();
+      memmove((char*)pa, mem, PGSIZE);
+      add_a_live_page(i,pa,oldpid);
+      add_a_live_page(i,(uint64)mem,newpid);
+      mappages(old, i, PGSIZE, pa, flags);
+      sfence_vma();
+    } else {
+      memmove(mem, (char*)pa, PGSIZE);
+      add_a_live_page(i,(uint64)mem,newpid);
+    }
     if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
       goto err;
@@ -328,7 +364,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   return 0;
 
  err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+  uvmunmap(new, 0, i / PGSIZE, 1, oldpid);
   return -1;
 }
 

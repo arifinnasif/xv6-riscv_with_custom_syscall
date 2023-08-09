@@ -89,3 +89,14 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_sysinfo(void)
+{
+  printf("--------------------\n");
+  print_live_page_count_all();
+  printf("--------------------\n");
+  // add condition that might cause failure
+  return 0;
+}
+

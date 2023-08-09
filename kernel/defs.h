@@ -8,6 +8,13 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct swap;
+struct swap_info {
+  struct swap* swap_page;
+  uint64 swap_page_va;
+  int pid;
+  char exist;
+};
 
 // bio.c
 void            binit(void);
@@ -36,6 +43,8 @@ int             filewrite(struct file*, uint64, int n);
 
 // fs.c
 void            fsinit(int);
+uint            balloc(uint dev);
+void            bfree(int dev, uint b);
 int             dirlink(struct inode*, char*, uint);
 struct inode*   dirlookup(struct inode*, char*, uint*);
 struct inode*   ialloc(uint, short);
@@ -63,6 +72,12 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+void add_a_live_page(uint64 va, uint64 pa, int pid);
+struct swap_info remove_swap_info(uint64 swap_page_va, int pid);
+void remove_a_live_page(uint64 va, int pid);
+void remove_and_free_swap_info_by_pid(int pid);
+int get_live_page_count(int pid);
+void print_live_page_count_all();
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -88,7 +103,7 @@ int             fork(void);
 int             growproc(int);
 void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
-void            proc_freepagetable(pagetable_t, uint64);
+void            proc_freepagetable(pagetable_t, uint64, int pid);
 int             kill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
@@ -106,6 +121,14 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+pagetable_t get_pagetable_by_pid(int pid);
+
+// swap.c
+void            swapinit(void);
+void            swapfree(struct swap*);
+struct swap*    swapalloc(void);
+void            swapout(struct swap *dst_sp, char *src_pa);
+void            swapin(char *dst_pa, struct swap *src_sp);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -162,17 +185,19 @@ void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
 pagetable_t     uvmcreate(void);
 void            uvmfirst(pagetable_t, uchar *, uint);
-uint64          uvmalloc(pagetable_t, uint64, uint64, int);
-uint64          uvmdealloc(pagetable_t, uint64, uint64);
-int             uvmcopy(pagetable_t, pagetable_t, uint64);
-void            uvmfree(pagetable_t, uint64);
-void            uvmunmap(pagetable_t, uint64, uint64, int);
+uint64          uvmalloc(pagetable_t, uint64, uint64, int, int pid);
+uint64          uvmdealloc(pagetable_t, uint64, uint64, int pid);
+int             uvmcopy(pagetable_t, pagetable_t, uint64, int oldpid, int newpid);
+void            uvmfree(pagetable_t, uint64, int pid);
+void            uvmunmap(pagetable_t, uint64, uint64, int, int pid);
 void            uvmclear(pagetable_t, uint64);
 pte_t *         walk(pagetable_t, uint64, int);
 uint64          walkaddr(pagetable_t, uint64);
 int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
+void set_use_bit1(uint64 va, int pid);
+void set_use_bit2(uint64 va, pagetable_t pagetable);
 
 // plic.c
 void            plicinit(void);

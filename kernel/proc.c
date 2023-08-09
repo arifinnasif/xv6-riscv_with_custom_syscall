@@ -155,11 +155,18 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  release(&p->lock);
+  // printf("freeproc: %d\n", p->pid);
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  
+  remove_and_free_swap_info_by_pid(p->pid);
+  
+  // release(&p->lock);
   if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+    proc_freepagetable(p->pagetable, p->sz, p->pid);
+  // acquire(&p->lock);
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -169,6 +176,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  acquire(&p->lock);
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -189,7 +197,7 @@ proc_pagetable(struct proc *p)
   // to/from user space, so not PTE_U.
   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
               (uint64)trampoline, PTE_R | PTE_X) < 0){
-    uvmfree(pagetable, 0);
+    uvmfree(pagetable, 0, 0);
     return 0;
   }
 
@@ -197,8 +205,8 @@ proc_pagetable(struct proc *p)
   // trampoline.S.
   if(mappages(pagetable, TRAPFRAME, PGSIZE,
               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
-    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-    uvmfree(pagetable, 0);
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0, p->pid);
+    uvmfree(pagetable, 0, p->pid);
     return 0;
   }
 
@@ -208,11 +216,11 @@ proc_pagetable(struct proc *p)
 // Free a process's page table, and free the
 // physical memory it refers to.
 void
-proc_freepagetable(pagetable_t pagetable, uint64 sz)
+proc_freepagetable(pagetable_t pagetable, uint64 sz, int pid)
 {
-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
-  uvmfree(pagetable, sz);
+  uvmunmap(pagetable, TRAMPOLINE, 1, 0, 0);
+  uvmunmap(pagetable, TRAPFRAME, 1, 0, 0);
+  uvmfree(pagetable, sz, pid);
 }
 
 // a user program that calls exec("/init")
@@ -264,11 +272,11 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W, p->pid)) == 0) {
       return -1;
     }
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    sz = uvmdealloc(p->pagetable, sz, sz + n, p->pid);
   }
   p->sz = sz;
   return 0;
@@ -289,11 +297,14 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+  release(&np->lock);
+  if(uvmcopy(p->pagetable, np->pagetable, p->sz, p->pid, np->pid) < 0){
+    acquire(&np->lock);
     freeproc(np);
     release(&np->lock);
     return -1;
   }
+  acquire(&np->lock);
   np->sz = p->sz;
 
   // copy saved user registers.
@@ -414,9 +425,11 @@ wait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
-          freeproc(pp);
           release(&pp->lock);
           release(&wait_lock);
+          acquire(&pp->lock);
+          freeproc(pp);
+          release(&pp->lock);
           return pid;
         }
         release(&pp->lock);
@@ -681,3 +694,32 @@ procdump(void)
     printf("\n");
   }
 }
+
+pagetable_t get_pagetable_by_pid(int pid) {
+  if(pid == 0) return 0;
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid){
+      release(&p->lock);
+      return p->pagetable;
+    }
+    release(&p->lock);
+  }
+  // printf("ei process er pagetable nai %d\n", pid);
+  return 0;
+}
+
+void print_live_page_count_all() {
+  struct proc *p;
+
+  printf("PID\tLIVE_PAGE_COUNT\n");
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->state != UNUSED) {
+      printf("%d\t\t%d\n",p->pid, get_live_page_count(p->pid));
+    }
+    release(&p->lock);
+  }
+}
+
